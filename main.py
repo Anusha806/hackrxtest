@@ -3,8 +3,6 @@ from pydantic import BaseModel
 from typing import List
 from utils.splitter import semantic_split
 from utils.llm_chain import process_chunk_with_llm_async, process_batches
-from utils.embedding import embed_and_store_chunks, retrieve_similar_chunks
-from utils.reranker import rerank_chunks
 import requests
 import fitz
 import asyncio
@@ -28,32 +26,30 @@ async def run_rag(request: Request, body: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error downloading document: {e}")
 
-    # Extract PDF text
     pdf_text = ""
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         for page in doc:
             pdf_text += page.get_text()
 
-    # Split text into chunks
     chunks = semantic_split(pdf_text)
+    full_context = " ".join(chunks)
 
-    # Embed and store in vector DB
-    doc_id = embed_and_store_chunks(chunks)
+    # Prepare prompts
+    prompts = [
+        f"Based on the following document, answer the question:\n\nDocument:\n{full_context}\n\nQuestion:\n{q}"
+        for q in body.questions
+    ]
 
-    answers = []
-    for question in body.questions:
-        # Retrieve top-k similar chunks
-        retrieved = retrieve_similar_chunks(question, doc_id)
+    # Create tasks
+    tasks = [process_chunk_with_llm_async(p) for p in prompts]
 
-        # Rerank using cross-encoder or LLM reranker
-        top_chunk = rerank_chunks(question, retrieved)
+    # Run tasks in batches
+    responses = await process_batches(tasks, batch_size=5)
 
-        # Build prompt and ask LLM
-        prompt = f"Based on the following context, answer the question:\n\nContext:\n{top_chunk}\n\nQuestion:\n{question}"
-        task = process_chunk_with_llm_async(prompt)
-        response = await task
-        answers.append({"question": question, "answer": response})
+    # Return question-answer pairs
+    answers = [{"question": q, "answer": a} for q, a in zip(body.questions, responses)]
 
     return {
         "qa_pairs": answers
     }
+
